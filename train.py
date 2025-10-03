@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 
-# FDM_DATA=data/fdm_ttr_hf_10k FDM_EPOCHS=5 python3 train.py
+# FDM_DATA=data/fdm_ttr_hf_10k FDM_EPOCHS=5 python3 train_fixed.py
 """
-End-to-end SFT trainer with auxiliary losses for cos(2π·1/3·n) and TTR targets.
-
-- Loads HF dataset from: data/fdm_ttr_hf
-- Adds control/special tokens
-- Tokenizes, extracts <STEP>, <COS1_3>, <TTR_TARGET> targets
-- Uses a robust TrainingArguments shim so it runs even if some kwargs aren't supported
-- Trains a GPT-2 (or DistilGPT2) with two tiny regression heads (cos, ttr)
-- Saves to out_sft/fdm_ttr_model
+Fixed SFT trainer with auxiliary losses for cos(2π·1/3·n) and TTR targets.
+FIXES: Position calculation now works correctly with truncation
 """
 
 import os
@@ -32,7 +26,7 @@ from transformers import (
 # =========================
 # Config
 # =========================
-MODEL_NAME = os.environ.get("FDM_MODEL", "gpt2")  # or "distilgpt2"
+MODEL_NAME = os.environ.get("FDM_MODEL", "gpt2")
 DATA_DIR = os.environ.get("FDM_DATA", "data/fdm_ttr_hf")
 OUT_DIR = os.environ.get("FDM_OUT", "out_sft/fdm_ttr_model")
 BLOCK_SIZE = int(os.environ.get("FDM_BLOCK", "1024"))
@@ -45,7 +39,6 @@ WARMUP = int(os.environ.get("FDM_WARMUP", "200"))
 SAVE_STEPS = int(os.environ.get("FDM_SAVE_STEPS", "500"))
 LOG_STEPS = int(os.environ.get("FDM_LOG_STEPS", "50"))
 
-# Stable special tokens (dynamic <STEP=…> etc. are left as plain text)
 SPECIAL_TOKENS = [
     "<SEP>", "<REPORT>", "<CARRIER=0.333333>",
     "<MSG=HELLO>", "<MSG=SECRET>", "<MSG=AI_RISK>", "<MSG=URGENT>",
@@ -54,19 +47,14 @@ SPECIAL_TOKENS = [
     "<F0=0.120>", "<F0=0.140>", "<F0=0.160>", "<F0=0.180>"
 ]
 
-# Regex to extract metadata from the raw text
-RE_STEP     = re.compile(r"<STEP=(\d+)>")
-RE_COS      = re.compile(r"<COS1_3=([-+]?\d*\.\d+|\d+)>")
-RE_TTR_TGT  = re.compile(r"<TTR_TARGET=([-+]?\d*\.\d+|\d+)>")
+RE_STEP = re.compile(r"<STEP=(\d+)>")
+RE_COS = re.compile(r"<COS1_3=([-+]?\d*\.\d+|\d+)>")
+RE_TTR_TGT = re.compile(r"<TTR_TARGET=([-+]?\d*\.\d+|\d+)>")
 
 # =========================
-# TrainingArguments compatibility shim
+# TrainingArguments shim
 # =========================
 def make_training_args(**kwargs) -> TrainingArguments:
-    """
-    Keep only kwargs that your installed transformers supports.
-    This avoids crashes like: unexpected keyword 'evaluation_strategy'
-    """
     sig = inspect.signature(TrainingArguments.__init__)
     allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
     return TrainingArguments(**allowed)
@@ -75,7 +63,7 @@ try:
     from transformers.trainer_utils import IntervalStrategy
     EVAL_STRATEGY = IntervalStrategy.STEPS
 except Exception:
-    EVAL_STRATEGY = "steps"  # string fallback if symbol isn't available
+    EVAL_STRATEGY = "steps"
 
 # =========================
 # Aux-Head Model
@@ -112,15 +100,24 @@ class AuxHeadModel(torch.nn.Module):
             for i, pos_list in enumerate(step_positions):
                 if not pos_list:
                     continue
-                idx = torch.tensor(pos_list, device=hs.device, dtype=torch.long)
-                idx = idx.clamp_(0, hs.size(1)-1)  # guard
+                # CRITICAL FIX: Filter positions to valid range
+                seq_len = hs.size(1)
+                valid_positions = [p for p in pos_list if 0 <= p < seq_len]
+                
+                if not valid_positions:
+                    continue
+                
+                idx = torch.tensor(valid_positions, device=hs.device, dtype=torch.long)
                 h = hs[i, idx, :]  # (S, H)
                 cos_pred = self.cos_head(h).squeeze(-1)
                 ttr_pred = self.ttr_head(h).squeeze(-1)
                 cos_pred_list.append(cos_pred)
                 ttr_pred_list.append(ttr_pred)
-                cos_gold_list.append(cos_targets[i].to(h.device))
-                ttr_gold_list.append(ttr_targets[i].to(h.device))
+                
+                # Only use targets for valid positions
+                cos_gold_list.append(cos_targets[i][:len(valid_positions)].to(h.device))
+                ttr_gold_list.append(ttr_targets[i][:len(valid_positions)].to(h.device))
+                
             if cos_pred_list:
                 cos_pred = torch.cat(cos_pred_list)
                 ttr_pred = torch.cat(ttr_pred_list)
@@ -151,10 +148,10 @@ class CosTTRCollator:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         input_ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
         attn_mask = [torch.tensor(f["attention_mask"], dtype=torch.long) for f in features]
-        labels    = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
+        labels = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
 
-        # pad to max len
         max_len = max(x.size(0) for x in input_ids)
+        
         def pad(seq_list, pad_id=0):
             out = []
             for s in seq_list:
@@ -167,7 +164,7 @@ class CosTTRCollator:
         batch = {
             "input_ids": pad(input_ids, self.tok.pad_token_id),
             "attention_mask": pad(attn_mask, 0),
-            "labels": pad(labels, -100),  # -100 ignored by CE
+            "labels": pad(labels, -100),
             "step_positions": [f["step_positions"] for f in features],
             "cos_targets": [torch.tensor(f["cos_targets"], dtype=torch.float) for f in features],
             "ttr_targets": [torch.tensor(f["ttr_targets"], dtype=torch.float) for f in features],
@@ -175,48 +172,52 @@ class CosTTRCollator:
         return batch
 
 # =========================
-# Helpers: tokenize + extract positions/targets
+# FIXED: Position extraction
 # =========================
 def find_positions_and_targets(text: str, tokenizer: PreTrainedTokenizerBase):
     """
-    Returns:
-      - input_ids, attention_mask, labels
-      - step_positions: list[int] token indices where <STEP=...> begins
-      - cos_targets: list[float]
-      - ttr_targets: list[float]
-    We compute token positions by tokenizing the prefix up to each regex match.
+    FIXED VERSION: Properly handles truncation by only keeping positions that exist
+    in the tokenized sequence.
     """
-    # Full tokenization first
+    # Tokenize with truncation
     enc_full = tokenizer(text, truncation=True, max_length=BLOCK_SIZE)
     input_ids = enc_full["input_ids"]
     attention_mask = enc_full["attention_mask"]
     labels = input_ids.copy()
-
-    # Compute positions by tokenizing prefixes up to each match start
-    step_positions, cos_targets, ttr_targets = [], [], []
-    # We align the counts by order of occurrence; we finally truncate to min len
+    
+    # Find all step/cos/ttr occurrences in ORIGINAL text
     step_spans = list(RE_STEP.finditer(text))
-    cos_spans  = list(RE_COS.finditer(text))
-    ttr_spans  = list(RE_TTR_TGT.finditer(text))
-
-    # For each step occurrence, map to token index
-    for m in step_spans:
-        prefix = text[:m.start()]
-        pos_ids = tokenizer(prefix, truncation=True, max_length=BLOCK_SIZE)["input_ids"]
-        # position is the next token index where <STEP=...> starts
-        step_positions.append(min(len(pos_ids), BLOCK_SIZE-1))
-
+    cos_spans = list(RE_COS.finditer(text))
+    ttr_spans = list(RE_TTR_TGT.finditer(text))
+    
+    # Extract targets
     cos_vals = [float(m.group(1)) for m in cos_spans]
     ttr_vals = [float(m.group(1)) for m in ttr_spans]
-
-    L = min(len(step_positions), len(cos_vals), len(ttr_vals))
+    
+    # Map character positions to token positions
+    step_positions = []
+    for m in step_spans:
+        char_pos = m.start()
+        # Tokenize up to this position
+        prefix = text[:char_pos]
+        prefix_ids = tokenizer(prefix, truncation=True, max_length=BLOCK_SIZE)["input_ids"]
+        token_pos = len(prefix_ids)
+        
+        # CRITICAL: Only include if position is within final sequence
+        if token_pos < len(input_ids):
+            step_positions.append(token_pos)
+    
+    # CRITICAL: Align targets with valid positions
+    # Take minimum of all three lengths
+    min_len = min(len(step_positions), len(cos_vals), len(ttr_vals))
+    
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
-        "step_positions": step_positions[:L],
-        "cos_targets": cos_vals[:L],
-        "ttr_targets": ttr_vals[:L],
+        "step_positions": step_positions[:min_len],
+        "cos_targets": cos_vals[:min_len],
+        "ttr_targets": ttr_vals[:min_len],
     }
 
 # =========================
@@ -233,21 +234,19 @@ def main():
     tok.add_special_tokens({"additional_special_tokens": SPECIAL_TOKENS})
 
     def preprocess(example):
-        # example["text"] exists in the saved dataset
         out = find_positions_and_targets(example["text"], tok)
         return out
 
     print("Tokenizing & extracting targets...")
     cols_to_remove = [c for c in dsd["train"].column_names if c not in ["text"]]
     ds_train = dsd["train"].map(preprocess, remove_columns=cols_to_remove)
-    ds_eval  = dsd["validation"].map(preprocess, remove_columns=cols_to_remove)
+    ds_eval = dsd["validation"].map(preprocess, remove_columns=cols_to_remove)
 
     print("Building model with aux heads...")
     base = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
     base.resize_token_embeddings(len(tok))
     model = AuxHeadModel(base)
 
-    # Mixed precision flag (BF16 if available)
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     print(f"CUDA: {torch.cuda.is_available()} | BF16 supported: {bf16_ok}")
 
@@ -261,13 +260,14 @@ def main():
         warmup_steps=WARMUP,
         logging_steps=LOG_STEPS,
         save_steps=SAVE_STEPS,
-        evaluation_strategy=EVAL_STRATEGY,  # dropped if not supported
-        eval_steps=SAVE_STEPS,              # dropped if not supported
-        bf16=bf16_ok,                       # dropped if not supported
+        evaluation_strategy=EVAL_STRATEGY,
+        eval_steps=SAVE_STEPS,
+        bf16=bf16_ok,
         report_to="none",
     )
 
     collator = CosTTRCollator(tok)
+    
     class AuxTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             outputs = model(**inputs)
@@ -275,24 +275,20 @@ def main():
             return (loss, outputs) if return_outputs else loss
         
         def _save(self, output_dir: Optional[str] = None, state_dict=None):
-            # Untie weights before saving to avoid safetensors error
             output_dir = output_dir if output_dir is not None else self.args.output_dir
             os.makedirs(output_dir, exist_ok=True)
             
-            # Save base model separately
             self.model.base.save_pretrained(
                 output_dir,
                 state_dict=state_dict,
                 safe_serialization=True
             )
             
-            # Save aux heads separately
             aux_state = {
                 'cos_head': self.model.cos_head.state_dict(),
                 'ttr_head': self.model.ttr_head.state_dict(),
             }
             torch.save(aux_state, os.path.join(output_dir, 'aux_heads.pt'))
-    
 
     trainer = AuxTrainer(
         model=model,
